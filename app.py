@@ -91,21 +91,36 @@ def ceiling(n):
             return cap
     return 100
 
-def dictionary(word):
-    """Only manually reviewed definitions; never turn search snippets into meanings."""
-    import json
-    from pathlib import Path
-    entries = {}
-    path = Path(__file__).with_name('definitions.json')
-    if path.exists():
-        try:
-            entries = json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            entries = {}
-    entry = entries.get(word)
-    if isinstance(entry, dict) and entry.get('verified') is True and entry.get('definition') and entry.get('source_url'):
-        return entry['definition'], entry['source_url']
-    return None, 'https://sozdikqor.kz/search?q=' + quote(word)
+def ai_definition(word):
+    """Generate an AI explanation, never label it a verified dictionary quotation."""
+    key = os.getenv('GEMINI_API_KEY', '').strip()
+    if not key:
+        return None, 'ЖИ түсіндірмесі қолжетімсіз: GEMINI_API_KEY орнатылмаған'
+    model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+    endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent'
+    prompt = (
+        'Қазақ тілінің оқушыға түсінікті сөз түсіндірушісі бол. '
+        'Төмендегі бір сөздің мағынасын қазақша 1-3 қысқа сөйлеммен түсіндір. '
+        'Егер бірнеше кең таралған мағынасы болса, оларды ажырат. '
+        'Ойдан дерек, шығарма үзіндісі немесе жалған дәйексөз қоспа. '
+        'Мағынасына сенімді болмасаң, дәл «Мағынасы анық емес» деп жауап бер. '
+        'Тек түсіндірмені жаз. Сөз: ' + word
+    )
+    try:
+        response = SESSION.post(endpoint, headers={'x-goog-api-key': key},
+            json={'contents': [{'parts': [{'text': prompt}]}],
+                  'generationConfig': {'temperature': 0.1, 'maxOutputTokens': 350}}, timeout=35)
+        if response.status_code != 200:
+            return None, 'ЖИ қызметі уақытша қолжетімсіз (HTTP ' + str(response.status_code) + ')'
+        data = response.json()
+        candidates = data.get('candidates') or []
+        parts = ((candidates[0].get('content') or {}).get('parts') or []) if candidates else []
+        text = ' '.join(p.get('text', '') for p in parts if isinstance(p, dict)).strip()
+        if not text or 'Мағынасы анық емес' in text:
+            return None, 'ЖИ сөздің мағынасын сенімді түсіндіре алмады'
+        return text[:1000], None
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return None, 'ЖИ қызметімен байланыс орнатылмады'
 
 @app.get('/api/analyze')
 def analyze():
@@ -126,13 +141,16 @@ def analyze():
     # Do not assign a misleading low score when the count looks unreliable.
     unreliable = n is None or (n < len(organic)) or (n <= 100 and len(organic) >= 5)
     ctx = contexts(base)
-    meaning, dictionary_url = dictionary(word)
+    meaning, ai_error = ai_definition(word)
+    if not meaning:
+        meaning = ai_error or 'ЖИ түсіндірмесі әзірге қолжетімсіз'
+    dictionary_url = ''
     if unreliable:
         result = dict(live=False, word=word, total_results=None, frequency_score=None,
                       current_activity=None, vitality=None, status='⚪ Дерек нақтыланбады',
                       context=ctx, meaning=meaning, dictionary_url=dictionary_url,
                       conclusion='Google нәтижелерінің жалпы саны сенімді анықталмады. Сөздің белсенділігіне баға берілмейді.',
-                      note='Бұл іздеу нәтижесі толық емес немесе күмәнді. Қате санның негізінде индекс есептелмеді.',
+                      note='ЖИ түсіндірмесі автоматты түрде жасалады, қате болуы мүмкін. ' + (ai_error or '') + ' Google нәтижесі күмәнді болғандықтан индекс есептелмеді.',
                       data_quality='unverified')
         # Do not cache unreliable counts; allow retry later.
         return jsonify(result), 503
@@ -153,7 +171,7 @@ def analyze():
     result = dict(live=True, word=word, total_results=n, frequency_score=f,
                   current_activity=activity, vitality=life, status=status, context=ctx,
                   meaning=meaning, dictionary_url=dictionary_url, conclusion=conclusion,
-                  note='Google/SerpApi саны шамаланған. Индекс — ғылыми дәлелденген болашақ болжамы емес. Сөздік анықтамасы тек тексерілген жағдайда көрсетіледі.',
+                  note='ЖИ түсіндірмесі автоматты түрде жасалды, қате болуы мүмкін. ' + (ai_error or '') + ' Google/SerpApi саны шамаланған; индекс болашақты дәл болжамайды.',
                   data_quality='estimated', context_sample_size=len(base.get('organic_results') or []))
     with LOCK:
         CACHE[word] = (now, result)
