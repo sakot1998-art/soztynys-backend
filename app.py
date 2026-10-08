@@ -71,48 +71,9 @@ def classify(d):
     return pct, count
 
 
-def gemini(word):
-    key = os.environ.get('GEMINI_API_KEY','').strip()
-    if not key:
-        return None, 'GEMINI_API_KEY орнатылмаған'
-    headers = {'x-goog-api-key':key}
-    try:
-        r = SESSION.get('https://generativelanguage.googleapis.com/v1beta/models', headers=headers, timeout=14)
-        if r.status_code != 200:
-            return None, 'Gemini модельдер тізімі қолжетімсіз (HTTP '+str(r.status_code)+')'
-        models = [m['name'].split('/',1)[1] for m in r.json().get('models',[]) if 'generateContent' in m.get('supportedGenerationMethods',[]) and m.get('name','').startswith('models/')]
-        preferred = os.environ.get('GEMINI_MODEL','').strip().replace('models/','')
-        candidates = ([preferred] if preferred in models else []) + [m for m in models if 'flash' in m and 'image' not in m and 'preview' not in m and 'tts' not in m]
-        candidates += [m for m in models if 'flash' in m]
-        candidates = list(dict.fromkeys(candidates))
-        if not candidates:
-            return None, 'Gemini мәтіндік моделі қолжетімсіз'
-        prompt = ('Қазақ тіліндегі мына бір сөздің мағынасын 7-сынып оқушысына 1-3 қысқа сөйлеммен түсіндір. '
-                  'Бірнеше кең таралған мағынасы болса, ажырат. Жалған дәйексөз қоспа. '
-                  'Белгісіз сөз болса, «Мағынасы анық емес» деп жаз. Тек түсіндірме бер. Сөз: '+word)
-        last_error = 'Gemini жауабы алынбады'
-        for model in candidates[:3]:
-            url = 'https://generativelanguage.googleapis.com/v1beta/models/'+model+':generateContent'
-            response = SESSION.post(url, headers=headers, json={'contents':[{'parts':[{'text':prompt}]}],
-                'generationConfig':{'temperature':0.1,'maxOutputTokens':500}},timeout=28)
-            if response.status_code in (404, 400):
-                last_error = 'Gemini моделі қолжетімсіз (HTTP '+str(response.status_code)+')'
-                continue
-            if response.status_code != 200:
-                return None, 'Gemini қатесі (HTTP '+str(response.status_code)+')'
-            parts = ((response.json().get('candidates') or [{}])[0].get('content') or {}).get('parts') or []
-            text = ' '.join(str(p.get('text','')) for p in parts if isinstance(p,dict)).strip()
-            if text and 'Мағынасы анық емес' not in text:
-                return text[:900], None
-            last_error = 'ЖИ сенімді түсіндірме бере алмады'
-        return None, last_error
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
-        return None, 'Gemini байланысы уақытша қолжетімсіз'
-
-
 @app.get('/api/health')
 def health():
-    return jsonify(ok=True, serpapi_configured=bool(os.getenv('SERPAPI_KEY')), gemini_configured=bool(os.getenv('GEMINI_API_KEY')))
+    return jsonify(ok=True, serpapi_configured=bool(os.getenv('SERPAPI_KEY')), version='3.1-serpapi')
 
 
 @app.get('/api/analyze')
@@ -127,7 +88,6 @@ def analyze():
     data, search_error = serp(word)
     ctx, sample_size = classify(data)
     n = estimate(data)
-    meaning, ai_error = gemini(word)
     f = round(max(0,min(100,(math.log10(max(n,1))-2)/6*100))) if n is not None else None
     # This is a one-time proxy score, NOT a historical trend or future prediction.
     activity = f
@@ -140,18 +100,19 @@ def analyze():
         conclusion = 'Бұл — сөздің интернеттегі таралуына негізделген шартты баға. Болашақта сөздің азаятынын немесе көбейетінін дәлелдемейді.'
     result = dict(live=True,word=word,total_results=n,frequency_score=f,current_activity=activity,
                   vitality=vitality,status=status,context=ctx,context_sample_size=sample_size,
-                  meaning=meaning,meaning_error=ai_error,dictionary_url='',
+                  meaning=None,meaning_error=None,dictionary_url='https://sozdikqor.kz/search?q='+word,
                   conclusion=conclusion,search_error=search_error,
-                  note='ЖИ түсіндірмесі қате болуы мүмкін. Google нәтижесі шамаланған. Қолданылу салалары тек алғашқы іздеу нәтижелеріне негізделеді.',
+                  note='Google/SerpApi нәтижелерінің жалпы саны шамаланған және кейде қолжетімсіз. Қолданылу салалары алғашқы іздеу нәтижелері бойынша жіктеледі.',
                   data_quality='estimated' if n is not None else 'unverified')
-    with LOCK:
-        CACHE[word]=(time.time(),result)
+    if not search_error and (n is not None or sample_size > 0):
+        with LOCK:
+            CACHE[word]=(time.time(),result)
     return jsonify(result)
 
 
 @app.get('/')
 def home():
-    return jsonify(service='SÖZTYNYS API',status='online',version='3.0')
+    return jsonify(service='SÖZTYNYS API',status='online',version='3.1-serpapi')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
