@@ -44,24 +44,46 @@ def frequency(n):
     return round(max(0, min(100, (math.log10(max(n, 1)) - 2) / 6 * 100)))
 
 def contexts(data):
-    categories = {'Жаңалық': 0, 'Білім': 0, 'Әдебиет/мәдениет': 0, 'Сөздік/анықтамалық': 0, 'Қазіргі web': 0}
-    rules = {
-        'Жаңалық': ['news', 'жаңалық', 'inform', '24.kz', 'tengri', 'zakon.kz'],
-        'Білім': ['edu', 'мектеп', 'университет', 'оқу', 'bilim', 'ustaz'],
-        'Әдебиет/мәдениет': ['әдеби', 'кітап', 'мәдениет', 'adebiportal', 'museum', 'кітапхана'],
-        'Сөздік/анықтамалық': ['sozdik', 'сөздік', 'dictionary', 'wikipedia', 'wiktionary'],
-        'Қазіргі web': ['youtube', 'instagram', 'tiktok', 'telegram', 'facebook', 'blog', 'forum', 'massaget']
+    """Classify each visible search result once; not the whole internet."""
+    categories = {
+        'Жаңалықтар мен БАҚ': 0,
+        'Білім және ғылым': 0,
+        'Әдебиет және мәдениет': 0,
+        'Әлеуметтік желілер': 0,
+        'Сөздіктер мен анықтамалықтар': 0,
+        'Басқа дереккөздер': 0,
     }
-    for item in data.get('organic_results') or []:
-        blob = ' '.join(str(item.get(k, '')) for k in ('title', 'snippet', 'link')).lower()
-        hits = [name for name, words in rules.items() if any(term in blob for term in words)]
-        if hits:
-            for name in hits:
-                categories[name] += 1
+    from urllib.parse import urlparse
+    for item in (data.get('organic_results') or []):
+        link = str(item.get('link', '')).lower()
+        host = (urlparse(link).hostname or '').removeprefix('www.')
+        blob = ' '.join(str(item.get(k, '')) for k in ('title', 'snippet')).lower()
+        def domain_matches(names):
+            return any(host == name or host.endswith('.' + name) for name in names)
+        # Prioritize site identity, then content indicators.
+        if domain_matches(('sozdikqor.kz','sozdik.kz','wiktionary.org','wikipedia.org','termincom.kz')):
+            category = 'Сөздіктер мен анықтамалықтар'
+        elif domain_matches(('instagram.com','tiktok.com','facebook.com','youtube.com','youtu.be','telegram.me','t.me','threads.net','vk.com','reddit.com')):
+            category = 'Әлеуметтік желілер'
+        elif domain_matches(('adebiportal.kz','kitap.kz','massaget.kz','museum.kz')) or any(k in blob for k in ('өлең','роман','шығарма','әдебиет','музей','мәдени мұра')):
+            category = 'Әдебиет және мәдениет'
+        elif domain_matches(('edu.kz','qazcorpus.kz','bilimland.kz','ust.kz','ustaz.kz')) or any(k in blob for k in ('ғылыми мақала','университет','оқулық','зерттеу жұмысы')):
+            category = 'Білім және ғылым'
+        elif domain_matches(('inform.kz','24.kz','tengrinews.kz','zakon.kz','qazaqstan.tv','azattyq.org')) or any(k in blob for k in ('жаңалықтар','ақпарат агенттігі','хабарлады')):
+            category = 'Жаңалықтар мен БАҚ'
         else:
-            categories['Қазіргі web'] += 1
-    total = max(1, sum(categories.values()))
-    return {name: round(count / total * 100) for name, count in categories.items()}
+            category = 'Басқа дереккөздер'
+        categories[category] += 1
+    total = sum(categories.values())
+    if total == 0:
+        return {name: 0 for name in categories}
+    # Largest-remainder method: rounded percentages sum exactly to 100.
+    raw = {k: 100 * v / total for k, v in categories.items()}
+    values = {k: int(v) for k, v in raw.items()}
+    remainder = 100 - sum(values.values())
+    for k in sorted(categories, key=lambda k: raw[k] - values[k], reverse=True)[:remainder]:
+        values[k] += 1
+    return values
 
 def ceiling(n):
     for limit, cap in ((1000, 10), (10000, 25), (50000, 40), (250000, 55), (1000000, 70), (10000000, 85)):
@@ -70,8 +92,20 @@ def ceiling(n):
     return 100
 
 def dictionary(word):
-    # Do not use Google snippets as dictionary definitions: they may quote fiction.
-    return VERIFIED_DEFINITIONS.get(word), 'https://sozdikqor.kz/search?q=' + quote(word)
+    """Only manually reviewed definitions; never turn search snippets into meanings."""
+    import json
+    from pathlib import Path
+    entries = {}
+    path = Path(__file__).with_name('definitions.json')
+    if path.exists():
+        try:
+            entries = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            entries = {}
+    entry = entries.get(word)
+    if isinstance(entry, dict) and entry.get('verified') is True and entry.get('definition') and entry.get('source_url'):
+        return entry['definition'], entry['source_url']
+    return None, 'https://sozdikqor.kz/search?q=' + quote(word)
 
 @app.get('/api/analyze')
 def analyze():
@@ -94,24 +128,24 @@ def analyze():
     ctx = contexts(base)
     meaning, dictionary_url = dictionary(word)
     if unreliable:
-        result = dict(live=True, word=word, total_results=None, frequency_score=None,
+        result = dict(live=False, word=word, total_results=None, frequency_score=None,
                       current_activity=None, vitality=None, status='⚪ Дерек нақтыланбады',
                       context=ctx, meaning=meaning, dictionary_url=dictionary_url,
                       conclusion='Google нәтижелерінің жалпы саны сенімді анықталмады. Сөздің белсенділігіне баға берілмейді.',
                       note='Бұл іздеу нәтижесі толық емес немесе күмәнді. Қате санның негізінде индекс есептелмеді.',
                       data_quality='unverified')
         # Do not cache unreliable counts; allow retry later.
-        return jsonify(result)
+        return jsonify(result), 503
     f = frequency(n)
     recent, recent_error = google_search(word, 'qdr:y')
     rn = count_results(recent) if not recent_error and recent else None
-    recent_signal = round(min(1.0, rn / max(n, 1)) * 100) if rn is not None else 0
-    activity = min(ceiling(n), round(.75 * f + .25 * recent_signal))
+    recent_signal = round(min(1.0, rn / max(n, 1)) * 100) if rn is not None else None
+    activity = min(ceiling(n), round(.75 * f + .25 * recent_signal)) if recent_signal is not None else min(ceiling(n), f)
     life = round(.75 * f + .25 * activity)
     status = '🟢 Белсенді' if life >= 70 else ('🟡 Орташа таралған' if life >= 40 else ('🟠 Сирек' if life >= 20 else '🔴 Өте сирек'))
-    dominant = max(ctx, key=ctx.get)
-    if ctx['Сөздік/анықтамалық'] >= 40 and activity < 50:
-        conclusion = f'«{word}» цифрлық кеңістікте кездеседі, бірақ қазіргі қолданысының көрсеткіші шектеулі. Нәтижелердің елеулі бөлігі сөздік/анықтамалық ортаға тиесілі.'
+    dominant = max(ctx, key=ctx.get) if any(ctx.values()) else 'дерек жеткіліксіз'
+    if ctx['Сөздіктер мен анықтамалықтар'] >= 40 and activity < 50:
+        conclusion = f'«{word}» цифрлық кеңістікте кездеседі, бірақ қазіргі қолданысының көрсеткіші шектеулі. Нәтижелердің елеулі бөлігі сөздіктер мен анықтамалықтарға тиесілі.'
     elif activity >= 65:
         conclusion = f'«{word}» цифрлық кеңістікте белсенді көрінеді. Іздеу нәтижелерінде басым орта — {dominant.lower()}.'
     else:
@@ -120,7 +154,7 @@ def analyze():
                   current_activity=activity, vitality=life, status=status, context=ctx,
                   meaning=meaning, dictionary_url=dictionary_url, conclusion=conclusion,
                   note='Google/SerpApi саны шамаланған. Индекс — ғылыми дәлелденген болашақ болжамы емес. Сөздік анықтамасы тек тексерілген жағдайда көрсетіледі.',
-                  data_quality='estimated')
+                  data_quality='estimated', context_sample_size=len(base.get('organic_results') or []))
     with LOCK:
         CACHE[word] = (now, result)
     return jsonify(result)
