@@ -1,3 +1,99 @@
+import os, re, math, time, threading, requests
+from urllib.parse import quote
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+
+app = Flask(__name__, static_folder='static', static_url_path='')
+app.json.ensure_ascii = False
+CORS(app, resources={r'/api/*': {'origins': '*'}})
+SESSION = requests.Session()
+CACHE = {}
+LOCK = threading.Lock()
+TTL = 12 * 3600
+
+# Verified definitions can be added here only after checking a reliable dictionary.
+VERIFIED_DEFINITIONS = {}
+
+def google_search(word, tbs=None):
+    key = os.getenv('SERPAPI_KEY', '').strip()
+    if not key:
+        return None, 'SerpApi кілті орнатылмаған'
+    params = {'engine': 'google', 'q': '"' + word + '"', 'gl': 'kz', 'hl': 'kk', 'api_key': key, 'num': 10}
+    if tbs:
+        params['tbs'] = tbs
+    try:
+        response = SESSION.get('https://serpapi.com/search.json', params=params, timeout=25)
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return None, 'Іздеу қызметімен байланыс орнатылмады'
+    if response.status_code != 200 or data.get('error'):
+        return None, str(data.get('error') or 'Іздеу қызметінің қатесі')
+    return data, None
+
+def count_results(data):
+    info = data.get('search_information') or {}
+    value = info.get('total_results')
+    if value is None:
+        return None
+    try:
+        n = int(str(value).replace(',', '').replace(' ', ''))
+        return n if n >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+def frequency(n):
+    return round(max(0, min(100, (math.log10(max(n, 1)) - 2) / 6 * 100)))
+
+def contexts(data):
+    """Classify each visible search result once; not the whole internet."""
+    categories = {
+        'Жаңалықтар мен БАҚ': 0,
+        'Білім және ғылым': 0,
+        'Әдебиет және мәдениет': 0,
+        'Әлеуметтік желілер': 0,
+        'Сөздіктер мен анықтамалықтар': 0,
+        'Басқа дереккөздер': 0,
+    }
+    from urllib.parse import urlparse
+    for item in (data.get('organic_results') or []):
+        link = str(item.get('link', '')).lower()
+        host = (urlparse(link).hostname or '').removeprefix('www.')
+        blob = ' '.join(str(item.get(k, '')) for k in ('title', 'snippet')).lower()
+        def domain_matches(names):
+            return any(host == name or host.endswith('.' + name) for name in names)
+        # Prioritize site identity, then content indicators.
+        if domain_matches(('sozdikqor.kz','sozdik.kz','wiktionary.org','wikipedia.org','termincom.kz')):
+            category = 'Сөздіктер мен анықтамалықтар'
+        elif domain_matches(('instagram.com','tiktok.com','facebook.com','youtube.com','youtu.be','telegram.me','t.me','threads.net','vk.com','reddit.com')):
+            category = 'Әлеуметтік желілер'
+        elif domain_matches(('adebiportal.kz','kitap.kz','massaget.kz','museum.kz')) or any(k in blob for k in ('өлең','роман','шығарма','әдебиет','музей','мәдени мұра')):
+            category = 'Әдебиет және мәдениет'
+        elif domain_matches(('edu.kz','qazcorpus.kz','bilimland.kz','ust.kz','ustaz.kz')) or any(k in blob for k in ('ғылыми мақала','университет','оқулық','зерттеу жұмысы')):
+            category = 'Білім және ғылым'
+        elif domain_matches(('inform.kz','24.kz','tengrinews.kz','zakon.kz','qazaqstan.tv','azattyq.org')) or any(k in blob for k in ('жаңалықтар','ақпарат агенттігі','хабарлады')):
+            category = 'Жаңалықтар мен БАҚ'
+        else:
+            category = 'Басқа дереккөздер'
+        categories[category] += 1
+    total = sum(categories.values())
+    if total == 0:
+        return {name: 0 for name in categories}
+    # Largest-remainder method: rounded percentages sum exactly to 100.
+    raw = {k: 100 * v / total for k, v in categories.items()}
+    values = {k: int(v) for k, v in raw.items()}
+    remainder = 100 - sum(values.values())
+    for k in sorted(categories, key=lambda k: raw[k] - values[k], reverse=True)[:remainder]:
+        values[k] += 1
+    return values
+
+def ceiling(n):
+    for limit, cap in ((1000, 10), (10000, 25), (50000, 40), (250000, 55), (1000000, 70), (10000000, 85)):
+        if n < limit:
+            return cap
+    return 100
+
+def dictionary(word):
+    """Only manually reviewed definitions; never turn search snippets into meanings."""
     import json
     from pathlib import Path
     entries = {}
