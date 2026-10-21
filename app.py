@@ -108,12 +108,65 @@ def dictionary(word):
         return entry['definition'], entry['source_url']
     return None, 'https://sozdikqor.kz/search?q=' + quote(word)
 
+MODEL_CACHE = {}
+
+def available_model(key, exclude=None):
+    import hashlib
+    token = hashlib.sha256(key.encode()).hexdigest()
+    cached = MODEL_CACHE.get(token)
+    if cached and time.time() - cached[0] < 3600 and cached[1] != exclude:
+        return cached[1], None
+    try:
+        response = SESSION.get('https://generativelanguage.googleapis.com/v1beta/models',
+                               headers={'x-goog-api-key': key}, params={'pageSize': 1000}, timeout=8)
+        if response.status_code != 200:
+            return None, 'Gemini модельдер тізімі алынбады (HTTP ' + str(response.status_code) + ')'
+        candidates = []
+        for entry in response.json().get('models', []):
+            name = entry.get('name', '').removeprefix('models/')
+            if ('generateContent' in entry.get('supportedGenerationMethods', [])
+                and name.startswith('gemini-') and name != exclude
+                and not any(tag in name for tag in ('image', 'tts', 'audio', 'robotics', 'computer-use'))):
+                candidates.append(name)
+        candidates.sort(key=lambda name: ('flash' not in name, any(x in name for x in ('preview', 'experimental', '-exp')), name))
+        if not candidates:
+            return None, 'Бұл кілтке мәтіндік Gemini моделі табылмады'
+        MODEL_CACHE[token] = (time.time(), candidates[0])
+        return candidates[0], None
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None, 'Gemini модельдер тізіміне байланыс орнатылмады'
+
+def sample_data(word, data):
+    from urllib.parse import urlparse
+    sources = []
+    seen = set()
+    for item in data.get('organic_results') or []:
+        url = str(item.get('link', ''))
+        parsed = urlparse(url)
+        if parsed.scheme not in ('https', 'http') or not parsed.hostname or url in seen:
+            continue
+        seen.add(url)
+        sources.append(dict(title=str(item.get('title') or parsed.hostname), url=url,
+                            domain=parsed.hostname.removeprefix('www.'),
+                            snippet=str(item.get('snippet') or '')))
+    pattern = re.compile(r'(?<![а-яәіңғүұқөһё])' + re.escape(word) + r'(?![а-яәіңғүұқөһё])', re.I)
+    mentions = sum(bool(pattern.search(item['title'] + ' ' + item['snippet'])) for item in sources)
+    return dict(sources=sources, sample_result_count=len(sources),
+                sample_domain_count=len({item['domain'] for item in sources}),
+                sample_exact_mention_count=mentions,
+                fetched_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                query='"' + word + '"', sample_scope='SerpApi қайтарған алғашқы іздеу нәтижелері')
+
 def ai_meaning(word):
     """AI explanation is separate from verified dictionary definitions."""
     key = os.getenv('GEMINI_API_KEY', '').strip()
     if not key:
         return None, 'Gemini кілті орнатылмаған'
-    model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash').strip()
+    model = os.getenv('GEMINI_MODEL', '').strip()
+    if not model:
+        model, model_error = available_model(key)
+        if not model:
+            return None, model_error
     if not re.fullmatch(r'[a-zA-Z0-9._-]+', model):
         return None, 'GEMINI_MODEL атауы дұрыс емес'
     prompt = ('Қазақ тіліндегі «' + word + '» сөзінің мағынасын қазақша 3–5 сөйлеммен түсіндір. '
@@ -158,6 +211,7 @@ def analyze():
     # Do not assign a misleading low score when the count looks unreliable.
     unreliable = n is None or (n < len(organic)) or (n <= 100 and len(organic) >= 5)
     ctx = contexts(base)
+    evidence = sample_data(word, base)
     verified_meaning, dictionary_url = dictionary(word)
     meaning, meaning_error = ai_meaning(word)
     meaning_source = 'gemini' if meaning else None
@@ -173,6 +227,7 @@ def analyze():
                       data_quality='partial', context_sample_size=len(organic),
                       meaning_source=meaning_source, meaning_error=meaning_error)
         # Do not cache unreliable counts; allow retry later.
+        result.update(evidence)
         return jsonify(result), 200
     f = frequency(n)
     recent, recent_error = google_search(word, 'qdr:y')
@@ -194,6 +249,7 @@ def analyze():
                   note='Google/SerpApi саны шамаланған. Индекс — ғылыми дәлелденген болашақ болжамы емес. Сөздік анықтамасы тек тексерілген жағдайда көрсетіледі.',
                   data_quality='estimated', context_sample_size=len(organic),
                   meaning_source=meaning_source, meaning_error=meaning_error)
+    result.update(evidence)
     with LOCK:
         CACHE[word] = (now, result)
     return jsonify(result)
